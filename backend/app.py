@@ -53,8 +53,8 @@ RESULTS_PER_PAGE = 5
 def get_schema():
     return Schema(
         doc_id    = ID(stored=True, unique=True),
-        filename  = ID(stored=True),       # ✅ was STORED() — must be searchable
-        file_path = STORED(),              # ✅ fine, never searched
+        filename  = ID(stored=True),   # must be ID, not STORED — used in MultifieldParser
+        file_path = STORED(),
         file_type = KEYWORD(stored=True),
         content   = TEXT(analyzer=StemmingAnalyzer(), stored=True),
         modified  = DATETIME(stored=True),
@@ -296,7 +296,7 @@ def stats():
         for freq, term in r.most_distinctive_terms("content", number=10):
             if isinstance(term, bytes):
                 term = term.decode("utf-8")
-            top_terms.append({"term": term, "count": freq})
+            top_terms.append({"term": term, "count": int(freq)})
 
     return jsonify({
         "indexed":    True,

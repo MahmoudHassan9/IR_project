@@ -24,7 +24,7 @@ class _StatsScreenState extends State<StatsScreen> {
     final state = context.watch<AppState>();
     final theme = Theme.of(context);
 
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(32),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         // ── Header ──────────────────────────────────────────────────────
@@ -112,117 +112,115 @@ class _StatsContent extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    return Expanded(
-      child: SingleChildScrollView(
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          // ── Summary cards ───────────────────────────────────────────────
-          Row(children: [
-            _StatSummaryCard(
-              icon: Icons.description_rounded,
-              label: 'Total Documents',
-              value: stats.totalDocs.toString(),
-              color: theme.colorScheme.primary,
-            ),
-            const SizedBox(width: 16),
-            _StatSummaryCard(
-              icon: Icons.folder_special_rounded,
-              label: 'File Types',
-              value: stats.byType.length.toString(),
-              color: const Color(0xFF43A047),
-            ),
-            const SizedBox(width: 16),
-            _StatSummaryCard(
-              icon: Icons.text_fields_rounded,
-              label: 'Unique Terms (top)',
-              value: stats.topTerms.length.toString(),
-              color: const Color(0xFFFB8C00),
-            ),
-          ]),
-          const SizedBox(height: 28),
+    // ✅ FIX: removed Expanded wrapper — it conflicts with SingleChildScrollView
+    // and causes "Cannot hit test a render box that has never been laid out"
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // ── Summary cards ─────────────────────────────────────────────────
+      Row(children: [
+        _StatSummaryCard(
+          icon: Icons.description_rounded,
+          label: 'Total Documents',
+          value: stats.totalDocs.toString(),
+          color: theme.colorScheme.primary,
+        ),
+        const SizedBox(width: 16),
+        _StatSummaryCard(
+          icon: Icons.folder_special_rounded,
+          label: 'File Types',
+          value: stats.byType.length.toString(),
+          color: const Color(0xFF43A047),
+        ),
+        const SizedBox(width: 16),
+        _StatSummaryCard(
+          icon: Icons.text_fields_rounded,
+          label: 'Unique Terms (top)',
+          value: stats.topTerms.length.toString(),
+          color: const Color(0xFFFB8C00),
+        ),
+      ]),
+      const SizedBox(height: 28),
 
-          // ── Charts row ──────────────────────────────────────────────────
-          if (stats.byType.isNotEmpty)
-            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              // Pie chart
-              Expanded(
-                flex: 4,
-                child: _ChartCard(
-                  title: 'Documents by File Type',
-                  child: _PieSection(byType: stats.byType, colors: _typeColors),
-                ),
-              ),
-              const SizedBox(width: 16),
-              // Bar chart
-              Expanded(
-                flex: 6,
-                child: _ChartCard(
-                  title: 'Top 10 Most Frequent Terms',
-                  child: stats.topTerms.isEmpty
-                      ? const Center(child: Text('No terms yet.'))
-                      : _TermsBar(terms: stats.topTerms),
-                ),
-              ),
-            ]),
-
-          const SizedBox(height: 24),
-
-          // ── File type breakdown table ────────────────────────────────────
-          _SectionLabel('File Type Breakdown'),
-          const SizedBox(height: 12),
-          Card(
-            elevation: 0,
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-                side: BorderSide(color: theme.colorScheme.outlineVariant)),
-            child: Padding(
-              padding: const EdgeInsets.all(4),
-              child: Table(
-                columnWidths: const {
-                  0: FlexColumnWidth(1),
-                  1: FlexColumnWidth(2),
-                  2: FlexColumnWidth(1),
-                },
-                children: [
-                  _tableHeader(context),
-                  ...stats.byType.entries.toList().asMap().entries.map((e) {
-                    final color = _typeColors[e.key % _typeColors.length];
-                    return _tableRow(context, e.value.key, e.value.value,
-                        stats.totalDocs, color);
-                  }),
-                ],
-              ),
+      // ── Charts row ────────────────────────────────────────────────────
+      if (stats.byType.isNotEmpty)
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // Pie chart
+          Expanded(
+            flex: 4,
+            child: _ChartCard(
+              title: 'Documents by File Type',
+              child: _PieSection(byType: stats.byType, colors: _typeColors),
             ),
           ),
-
-          const SizedBox(height: 24),
-
-          // ── Top terms list ───────────────────────────────────────────────
-          if (stats.topTerms.isNotEmpty) ...[
-            _SectionLabel('Top 10 Terms'),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: stats.topTerms.asMap().entries.map((e) {
-                final color = _typeColors[e.key % _typeColors.length];
-                return Chip(
-                  avatar: CircleAvatar(
-                      backgroundColor: color,
-                      child: Text('${e.key + 1}',
-                          style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold))),
-                  label: Text('${e.value.term}  ·  ${e.value.count}'),
-                  backgroundColor: color.withOpacity(0.08),
-                  side: BorderSide(color: color.withOpacity(0.3)),
-                );
-              }).toList(),
+          const SizedBox(width: 16),
+          // Bar chart
+          Expanded(
+            flex: 6,
+            child: _ChartCard(
+              title: 'Top 10 Most Frequent Terms',
+              child: stats.topTerms.isEmpty
+                  ? const Center(child: Text('No terms yet.'))
+                  : _TermsBar(terms: stats.topTerms),
             ),
-          ],
+          ),
         ]),
+
+      const SizedBox(height: 24),
+
+      // ── File type breakdown table ──────────────────────────────────────
+      _SectionLabel('File Type Breakdown'),
+      const SizedBox(height: 12),
+      Card(
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: theme.colorScheme.outlineVariant)),
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Table(
+            columnWidths: const {
+              0: FlexColumnWidth(1),
+              1: FlexColumnWidth(2),
+              2: FlexColumnWidth(1),
+            },
+            children: [
+              _tableHeader(context),
+              ...stats.byType.entries.toList().asMap().entries.map((e) {
+                final color = _typeColors[e.key % _typeColors.length];
+                return _tableRow(context, e.value.key, e.value.value,
+                    stats.totalDocs, color);
+              }),
+            ],
+          ),
+        ),
       ),
-    );
+
+      const SizedBox(height: 24),
+
+      // ── Top terms list ─────────────────────────────────────────────────
+      if (stats.topTerms.isNotEmpty) ...[
+        _SectionLabel('Top 10 Terms'),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: stats.topTerms.asMap().entries.map((e) {
+            final color = _typeColors[e.key % _typeColors.length];
+            return Chip(
+              avatar: CircleAvatar(
+                  backgroundColor: color,
+                  child: Text('${e.key + 1}',
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold))),
+              label: Text('${e.value.term}  ·  ${e.value.count}'),
+              backgroundColor: color.withOpacity(0.08),
+              side: BorderSide(color: color.withOpacity(0.3)),
+            );
+          }).toList(),
+        ),
+      ],
+    ]);
   }
 
   TableRow _tableHeader(BuildContext ctx) {
