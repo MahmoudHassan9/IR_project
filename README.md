@@ -2,6 +2,19 @@
 
 A Flutter web frontend + Python (Whoosh) backend for the Information Retrieval final project.
 
+# Index view
+<img width="1917" height="906" alt="image" src="https://github.com/user-attachments/assets/7aa11b03-f0c9-4773-843f-7639ccbcaeb3" />
+
+# Search view
+<img width="1903" height="899" alt="image" src="https://github.com/user-attachments/assets/cdb7e37c-0e93-4a5d-813b-f7aeb98c84ad" />
+
+# Stats view 
+<img width="1895" height="887" alt="image" src="https://github.com/user-attachments/assets/fa994bc3-c262-4aa3-b4ed-8312d1e6c0e0" />
+
+
+
+
+
 ---
 
 ## How to Run
