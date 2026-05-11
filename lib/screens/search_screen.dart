@@ -466,7 +466,7 @@ class _HighlightedSnippet extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final spans = <TextSpan>[];
-    final regex = RegExp(r'<mark>(.*?)</mark>', dotAll: true);
+    final regex = RegExp(r'<mark[^>]*>(.*?)</mark>', dotAll: true);
     int last = 0;
     for (final m in regex.allMatches(html)) {
       if (m.start > last) {

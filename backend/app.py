@@ -56,7 +56,7 @@ def get_schema():
         filename  = ID(stored=True),   # must be ID, not STORED — used in MultifieldParser
         file_path = STORED(),
         file_type = KEYWORD(stored=True),
-        content   = TEXT(analyzer=StemmingAnalyzer(), stored=True),
+        content   = TEXT(analyzer=StemmingAnalyzer(), stored=True, spelling=True),
         modified  = DATETIME(stored=True),
     )
 
@@ -239,21 +239,31 @@ def search():
                 continue
             if len(items) >= RESULTS_PER_PAGE:
                 break
-            snippet = hlt.highlight_hit(hit, "content", minscore=0) or ""
+            
+            # Generate highlighted snippet
+            snippet = hlt.highlight_hit(hit, "content", minscore=0)
+            
+            # Fallback: If highlighting didn't produce anything (e.g. match in filename only),
+            # use the beginning of the content.
+            if not snippet:
+                full_txt = hit.get("content", "")
+                snippet = (full_txt[:200] + " …") if len(full_txt) > 200 else full_txt
+                
             items.append({
                 "filename":      hit["filename"],
                 "file_path":     hit["file_path"],
                 "file_type":     hit["file_type"],
                 "score":         round(hit.score, 4),
                 "modified_date": hit["modified"].isoformat() if hit["modified"] else "",
-                "snippet":       snippet,
+                "snippet":       snippet or "",
             })
 
         # ── Did you mean? ────────────────────────────────────────────────────
         did_you_mean = None
         if total == 0:
             try:
-                corrected = s.correct_query(query, qp)
+                # ✅ FIX: correct_query requires the query string (q_str), not the parser object (qp)
+                corrected = s.correct_query(query, q_str)
                 if corrected.query != query:
                     did_you_mean = str(corrected.string)
             except Exception:
