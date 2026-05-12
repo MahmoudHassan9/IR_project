@@ -1,33 +1,28 @@
 """
-Mini Search Engine – Flask Backend
-===================================
+Mini Search Engine – Flask Backend (Elasticsearch)
+====================================================
 Endpoints:
   POST /api/build-index   – Index a folder with selected file formats
   GET  /api/search        – Search with filters, pagination, snippet highlighting
   GET  /api/stats         – Index stats (total docs, by-type, top-10 terms)
 
 Requires:
-  pip install whoosh flask flask-cors pypdf2 openpyxl
+  pip install elasticsearch flask flask-cors pypdf2 openpyxl
+  Elasticsearch 8.x running on http://localhost:9200 (security disabled for local dev)
 """
 
 import os
 import json
 import csv
 import math
-import string
 from datetime import datetime
 from collections import Counter
 from pathlib import Path
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-# ── Whoosh imports ────────────────────────────────────────────────────────────
-from whoosh import index, qparser, highlight
-from whoosh.fields import Schema, TEXT, ID, STORED, DATETIME, KEYWORD
-from whoosh.qparser import MultifieldParser, FuzzyTermPlugin, WildcardPlugin
-from whoosh.analysis import StemmingAnalyzer
-from whoosh.searching import Searcher
+from elasticsearch import Elasticsearch, helpers
+from elasticsearch.exceptions import ConnectionError as ESConnectionError
 
 # ── Optional readers ──────────────────────────────────────────────────────────
 try:
@@ -46,24 +41,42 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-INDEX_DIR = ".search_index"
+ES_HOST          = "http://localhost:9200"
+INDEX_NAME       = "mini_search"
 RESULTS_PER_PAGE = 5
 
-# ── Whoosh schema ─────────────────────────────────────────────────────────────
-def get_schema():
-    return Schema(
-        doc_id    = ID(stored=True, unique=True),
-        filename  = ID(stored=True),   # must be ID, not STORED — used in MultifieldParser
-        file_path = STORED(),
-        file_type = KEYWORD(stored=True),
-        content   = TEXT(analyzer=StemmingAnalyzer(), stored=True, spelling=True),
-        modified  = DATETIME(stored=True),
-    )
+es = Elasticsearch(hosts=[ES_HOST])
 
-def get_index():
-    if index.exists_in(INDEX_DIR):
-        return index.open_dir(INDEX_DIR)
-    return None
+# ── Elasticsearch index mapping ───────────────────────────────────────────────
+INDEX_MAPPING = {
+    "settings": {
+        "analysis": {
+            "analyzer": {
+                "content_analyzer": {
+                    "type":      "custom",
+                    "tokenizer": "standard",
+                    "filter":    ["lowercase", "stop", "snowball"]
+                }
+            }
+        }
+    },
+    "mappings": {
+        "properties": {
+            "filename":  {"type": "text", "analyzer": "standard",
+                          "fields": {"keyword": {"type": "keyword"}}},
+            "file_path": {"type": "keyword"},
+            "file_type": {"type": "keyword"},
+            "content":   {"type": "text", "analyzer": "content_analyzer"},
+            "modified":  {"type": "date"},
+        }
+    }
+}
+
+def ensure_connected() -> bool:
+    try:
+        return es.ping()
+    except ESConnectionError:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +139,11 @@ EXTRACTORS = {
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/build-index", methods=["POST"])
 def build_index():
+    if not ensure_connected():
+        return jsonify({"success": False,
+                        "error": f"Cannot connect to Elasticsearch at {ES_HOST}. "
+                                  "Make sure it is running."}), 503
+
     body    = request.get_json(force=True)
     folder  = body.get("folder_path", "").strip()
     formats = [f.lower().lstrip(".") for f in body.get("formats", [])]
@@ -135,37 +153,45 @@ def build_index():
     if not formats:
         return jsonify({"success": False, "error": "No formats selected."}), 400
 
-    os.makedirs(INDEX_DIR, exist_ok=True)
-    ix = index.create_in(INDEX_DIR, get_schema())
-    writer = ix.writer()
+    # Delete + recreate index for a clean build
+    if es.indices.exists(index=INDEX_NAME):
+        es.indices.delete(index=INDEX_NAME)
+    es.indices.create(index=INDEX_NAME, body=INDEX_MAPPING)
 
     by_type: Counter = Counter()
+    actions  = []
 
     for root, _, files in os.walk(folder):
         for fname in files:
             ext = Path(fname).suffix.lstrip(".").lower()
             if ext not in formats:
                 continue
-            fpath = os.path.join(root, fname)
+            fpath     = os.path.join(root, fname)
             extractor = EXTRACTORS.get(ext)
             if extractor is None:
                 continue
             try:
                 content = extractor(fpath)
-                mtime   = datetime.fromtimestamp(os.path.getmtime(fpath))
-                writer.add_document(
-                    doc_id    = fpath,
-                    filename  = fname,
-                    file_path = fpath,
-                    file_type = ext,
-                    content   = content,
-                    modified  = mtime,
-                )
+                mtime   = datetime.fromtimestamp(os.path.getmtime(fpath)).isoformat()
+                actions.append({
+                    "_index": INDEX_NAME,
+                    "_id":    fpath,
+                    "_source": {
+                        "filename":  fname,
+                        "file_path": fpath,
+                        "file_type": ext,
+                        "content":   content,
+                        "modified":  mtime,
+                    }
+                })
                 by_type[ext] += 1
             except Exception as e:
                 print(f"[WARN] Skipping {fpath}: {e}")
 
-    writer.commit()
+    if actions:
+        helpers.bulk(es, actions)
+        es.indices.refresh(index=INDEX_NAME)
+
     total = sum(by_type.values())
     return jsonify({"success": True, "doc_count": total, "by_type": dict(by_type)})
 
@@ -175,6 +201,9 @@ def build_index():
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/search", methods=["GET"])
 def search():
+    if not ensure_connected():
+        return jsonify({"error": f"Cannot connect to Elasticsearch at {ES_HOST}"}), 503
+
     q_str     = request.args.get("q", "").strip()
     from_date = request.args.get("from_date", "").strip()
     to_date   = request.args.get("to_date", "").strip()
@@ -184,98 +213,116 @@ def search():
     if not q_str:
         return jsonify({"results": [], "total": 0, "page": 1, "total_pages": 0})
 
-    ix = get_index()
-    if ix is None:
+    if not es.indices.exists(index=INDEX_NAME):
         return jsonify({"error": "Index not built yet. Go to the Index tab first."}), 503
 
     # ── Build query ──────────────────────────────────────────────────────────
-    og = qparser.OrGroup.factory(0.9)
-    qp = MultifieldParser(["content", "filename"], schema=ix.schema, group=og)
-    qp.add_plugin(FuzzyTermPlugin())
-    qp.add_plugin(WildcardPlugin())
+    must_clauses = [{
+        "multi_match": {
+            "query":     q_str,
+            "fields":    ["content", "filename^2"],
+            "type":      "best_fields",
+            "fuzziness": "AUTO",
+        }
+    }]
 
-    try:
-        query = qp.parse(q_str)
-    except Exception as e:
-        # ✅ FIX: return the actual parse error so it's easier to debug
-        return jsonify({"error": f"Invalid query syntax: {e}"}), 400
+    filter_clauses = []
 
-    # ── Date filter ──────────────────────────────────────────────────────────
-    filter_query = None
+    if file_type and file_type not in ("all", ""):
+        filter_clauses.append({"term": {"file_type": file_type}})
+
     if from_date or to_date:
+        date_range: dict = {}
+        if from_date: date_range["gte"] = from_date
+        if to_date:   date_range["lte"] = to_date
+        filter_clauses.append({"range": {"modified": date_range}})
+
+    es_query = {
+        "bool": {
+            "must":   must_clauses,
+            "filter": filter_clauses,
+        }
+    }
+
+    # ── Highlighting ─────────────────────────────────────────────────────────
+    highlight_cfg = {
+        "fields": {
+            "content": {
+                "fragment_size":       200,
+                "number_of_fragments": 1,
+                "pre_tags":            ["<mark>"],
+                "post_tags":           ["</mark>"],
+            }
+        }
+    }
+
+    # ── Execute ──────────────────────────────────────────────────────────────
+    offset = (page - 1) * RESULTS_PER_PAGE
+    try:
+        resp = es.search(
+            index=INDEX_NAME,
+            query=es_query,
+            highlight=highlight_cfg,
+            from_=offset,
+            size=RESULTS_PER_PAGE,
+            track_total_hits=True,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Search failed: {e}"}), 400
+
+    total       = resp["hits"]["total"]["value"]
+    total_pages = max(1, math.ceil(total / RESULTS_PER_PAGE))
+
+    items = []
+    for hit in resp["hits"]["hits"]:
+        src     = hit["_source"]
+        snippet = " … ".join(hit.get("highlight", {}).get("content", []))
+        items.append({
+            "filename":      src["filename"],
+            "file_path":     src["file_path"],
+            "file_type":     src["file_type"],
+            "score":         round(hit["_score"] or 0, 4),
+            "modified_date": src.get("modified", ""),
+            "snippet":       snippet,
+        })
+
+    # ── Did you mean? ────────────────────────────────────────────────────────
+    did_you_mean = None
+    if total == 0:
         try:
-            from whoosh.query import DateRange
-            fd = datetime.strptime(from_date, "%Y-%m-%d") if from_date else None
-            td = datetime.strptime(to_date,   "%Y-%m-%d") if to_date   else None
-            filter_query = DateRange("modified", fd, td)
+            sug_resp = es.search(
+                index=INDEX_NAME,
+                suggest={
+                    "text": q_str,
+                    "phrase_suggest": {
+                        "phrase": {
+                            "field":     "content",
+                            "size":      1,
+                            "gram_size": 3,
+                            "direct_generator": [{
+                                "field":        "content",
+                                "suggest_mode": "missing"
+                            }],
+                        }
+                    }
+                },
+                size=0,
+            )
+            options = (sug_resp.get("suggest", {})
+                               .get("phrase_suggest", [{}])[0]
+                               .get("options", []))
+            if options:
+                did_you_mean = options[0]["text"]
         except Exception:
             pass
 
-    # ── File-type filter ─────────────────────────────────────────────────────
-    from whoosh.query import Term as WTerm, And as WAnd
-    if file_type and file_type not in ("all", ""):
-        ft_q  = WTerm("file_type", file_type)
-        query = WAnd([query, ft_q])
-
-    if filter_query:
-        query = WAnd([query, filter_query])
-
-    # ── Execute search ───────────────────────────────────────────────────────
-    with ix.searcher() as s:
-        offset      = (page - 1) * RESULTS_PER_PAGE
-        results_raw = s.search(query, limit=offset + RESULTS_PER_PAGE + 1)
-
-        total       = len(results_raw)
-        total_pages = max(1, math.ceil(total / RESULTS_PER_PAGE))
-
-        hlt = highlight.Highlighter(
-            fragmenter=highlight.ContextFragmenter(maxchars=200, surround=40),
-            formatter=highlight.HtmlFormatter(tagname="mark", between=" … "),
-        )
-
-        items = []
-        for i, hit in enumerate(results_raw):
-            if i < offset:
-                continue
-            if len(items) >= RESULTS_PER_PAGE:
-                break
-            
-            # Generate highlighted snippet
-            snippet = hlt.highlight_hit(hit, "content", minscore=0)
-            
-            # Fallback: If highlighting didn't produce anything (e.g. match in filename only),
-            # use the beginning of the content.
-            if not snippet:
-                full_txt = hit.get("content", "")
-                snippet = (full_txt[:200] + " …") if len(full_txt) > 200 else full_txt
-                
-            items.append({
-                "filename":      hit["filename"],
-                "file_path":     hit["file_path"],
-                "file_type":     hit["file_type"],
-                "score":         round(hit.score, 4),
-                "modified_date": hit["modified"].isoformat() if hit["modified"] else "",
-                "snippet":       snippet or "",
-            })
-
-        # ── Did you mean? ────────────────────────────────────────────────────
-        did_you_mean = None
-        if total == 0:
-            try:
-                # ✅ FIX: correct_query requires the query string (q_str), not the parser object (qp)
-                corrected = s.correct_query(query, q_str)
-                if corrected.query != query:
-                    did_you_mean = str(corrected.string)
-            except Exception:
-                pass
-
-        return jsonify({
-            "results":      items,
-            "total":        total,
-            "page":         page,
-            "total_pages":  total_pages,
-            "did_you_mean": did_you_mean,
-        })
+    return jsonify({
+        "results":      items,
+        "total":        total,
+        "page":         page,
+        "total_pages":  total_pages,
+        "did_you_mean": did_you_mean,
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,35 +330,52 @@ def search():
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/stats", methods=["GET"])
 def stats():
-    ix = get_index()
-    if ix is None:
+    if not ensure_connected():
+        return jsonify({
+            "indexed": False, "total_docs": 0, "by_type": {}, "top_terms": [],
+            "error": f"Cannot connect to Elasticsearch at {ES_HOST}"
+        })
+
+    if not es.indices.exists(index=INDEX_NAME):
         return jsonify({"indexed": False, "total_docs": 0, "by_type": {}, "top_terms": []})
 
-    with ix.reader() as r:
-        total = r.doc_count()
+    # Total doc count
+    total = es.count(index=INDEX_NAME)["count"]
 
-        # by_type: iterate stored file_type field
-        by_type: Counter = Counter()
-        for docnum in r.all_doc_ids():
-            fields = r.stored_fields(docnum)
-            ft = fields.get("file_type", "unknown")
-            # ✅ FIX: file_type may come back as bytes from Whoosh internals
-            if isinstance(ft, bytes):
-                ft = ft.decode("utf-8")
-            by_type[ft] += 1
+    # by_type aggregation
+    agg_resp = es.search(
+        index=INDEX_NAME,
+        size=0,
+        aggregations={
+            "by_type": {"terms": {"field": "file_type", "size": 20}}
+        }
+    )
+    by_type = {
+        b["key"]: b["doc_count"]
+        for b in agg_resp["aggregations"]["by_type"]["buckets"]
+    }
 
-        # top-10 terms from the content field
-        # ✅ FIX: most_distinctive_terms() yields (score, term) where term is bytes
+    # Top 10 terms via significant_text aggregation
+    top_terms = []
+    try:
+        terms_resp = es.search(
+            index=INDEX_NAME,
+            size=0,
+            aggregations={
+                "top_terms": {
+                    "significant_text": {"field": "content", "size": 10}
+                }
+            }
+        )
+        for b in terms_resp["aggregations"]["top_terms"]["buckets"]:
+            top_terms.append({"term": b["key"], "count": int(b["doc_count"])})
+    except Exception:
         top_terms = []
-        for freq, term in r.most_distinctive_terms("content", number=10):
-            if isinstance(term, bytes):
-                term = term.decode("utf-8")
-            top_terms.append({"term": term, "count": int(freq)})
 
     return jsonify({
         "indexed":    True,
         "total_docs": total,
-        "by_type":    dict(by_type),
+        "by_type":    by_type,
         "top_terms":  top_terms,
     })
 
@@ -319,4 +383,9 @@ def stats():
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Starting Mini Search Engine backend on http://localhost:5000")
+    print(f"Connecting to Elasticsearch at {ES_HOST}")
+    if ensure_connected():
+        print("✓ Elasticsearch is reachable")
+    else:
+        print("✗ WARNING: Elasticsearch is NOT reachable — start it before indexing")
     app.run(debug=True, port=5000)
