@@ -7,8 +7,8 @@ Endpoints:
   GET  /api/stats         – Index stats (total docs, by-type, top-10 terms)
 
 Requires:
-  pip install elasticsearch flask flask-cors pypdf2 openpyxl
-  Elasticsearch 8.x running on http://localhost:9200 (security disabled for local dev)
+  pip install elasticsearch flask flask-cors PyPDF2 openpyxl
+  Elasticsearch 8.x running on http://localhost:9200
 """
 
 import os
@@ -24,7 +24,6 @@ from flask_cors import CORS
 from elasticsearch import Elasticsearch, helpers
 from elasticsearch.exceptions import ConnectionError as ESConnectionError
 
-# ── Optional readers ──────────────────────────────────────────────────────────
 try:
     from PyPDF2 import PdfReader
     HAS_PDF = True
@@ -55,22 +54,26 @@ INDEX_MAPPING = {
                 "content_analyzer": {
                     "type":      "custom",
                     "tokenizer": "standard",
-                    "filter":    ["lowercase", "stop", "snowball"]
+                    "filter":    ["lowercase", "stop", "snowball"],
                 }
             }
         }
     },
     "mappings": {
         "properties": {
-            "filename":  {"type": "text", "analyzer": "standard",
-                          "fields": {"keyword": {"type": "keyword"}}},
+            "filename": {
+                "type":     "text",
+                "analyzer": "standard",
+                "fields":   {"keyword": {"type": "keyword"}},
+            },
             "file_path": {"type": "keyword"},
             "file_type": {"type": "keyword"},
             "content":   {"type": "text", "analyzer": "content_analyzer"},
             "modified":  {"type": "date"},
         }
-    }
+    },
 }
+
 
 def ensure_connected() -> bool:
     try:
@@ -87,25 +90,32 @@ def extract_txt(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
+
 def extract_pdf(path: str) -> str:
     if not HAS_PDF:
         return ""
     reader = PdfReader(path)
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
+
 def extract_json(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         data = json.load(f)
     parts: list[str] = []
+
     def _walk(obj):
         if isinstance(obj, dict):
-            for v in obj.values(): _walk(v)
+            for v in obj.values():
+                _walk(v)
         elif isinstance(obj, list):
-            for v in obj: _walk(v)
+            for v in obj:
+                _walk(v)
         elif isinstance(obj, str):
             parts.append(obj)
+
     _walk(data)
     return " ".join(parts)
+
 
 def extract_csv(path: str) -> str:
     rows = []
@@ -114,6 +124,7 @@ def extract_csv(path: str) -> str:
         for row in reader:
             rows.append(" ".join(row))
     return "\n".join(rows)
+
 
 def extract_xlsx(path: str) -> str:
     if not HAS_XLSX:
@@ -124,6 +135,7 @@ def extract_xlsx(path: str) -> str:
         for row in ws.iter_rows(values_only=True):
             parts.extend(str(c) for c in row if c is not None)
     return " ".join(parts)
+
 
 EXTRACTORS = {
     "txt":  extract_txt,
@@ -140,9 +152,11 @@ EXTRACTORS = {
 @app.route("/api/build-index", methods=["POST"])
 def build_index():
     if not ensure_connected():
-        return jsonify({"success": False,
-                        "error": f"Cannot connect to Elasticsearch at {ES_HOST}. "
-                                  "Make sure it is running."}), 503
+        return jsonify({
+            "success": False,
+            "error": f"Cannot connect to Elasticsearch at {ES_HOST}. "
+                     "Make sure it is running.",
+        }), 503
 
     body    = request.get_json(force=True)
     folder  = body.get("folder_path", "").strip()
@@ -159,7 +173,7 @@ def build_index():
     es.indices.create(index=INDEX_NAME, body=INDEX_MAPPING)
 
     by_type: Counter = Counter()
-    actions  = []
+    actions = []
 
     for root, _, files in os.walk(folder):
         for fname in files:
@@ -172,7 +186,9 @@ def build_index():
                 continue
             try:
                 content = extractor(fpath)
-                mtime   = datetime.fromtimestamp(os.path.getmtime(fpath)).isoformat()
+                mtime   = datetime.fromtimestamp(
+                    os.path.getmtime(fpath)
+                ).isoformat()
                 actions.append({
                     "_index": INDEX_NAME,
                     "_id":    fpath,
@@ -182,7 +198,7 @@ def build_index():
                         "file_type": ext,
                         "content":   content,
                         "modified":  mtime,
-                    }
+                    },
                 })
                 by_type[ext] += 1
             except Exception as e:
@@ -216,27 +232,42 @@ def search():
     if not es.indices.exists(index=INDEX_NAME):
         return jsonify({"error": "Index not built yet. Go to the Index tab first."}), 503
 
-    # ── Build query ──────────────────────────────────────────────────────────
-    must_clauses = [{
-        "multi_match": {
-            "query":     q_str,
-            "fields":    ["content", "filename^2"],
-            "type":      "best_fields",
-            "fuzziness": "AUTO",
+    # ── Main query ────────────────────────────────────────────────────────────
+    # query_string supports ALL required syntax in one place:
+    #   Boolean  →  python AND flask  |  java OR python  |  search NOT google
+    #   Grouping →  (python OR java) AND search
+    #   Phrase   →  "information retrieval"
+    #   Fuzzy    →  retrival~  |  retrival~2
+    #   Wildcard →  inform*  |  ?earch
+    must_clauses = [
+        {
+            "query_string": {
+                "query":                q_str,
+                "fields":               ["content", "filename^2"],
+                "fuzziness":            "AUTO",
+                "default_operator":     "OR",
+                "allow_leading_wildcard": True,
+            }
         }
-    }]
+    ]
 
+    # ── Filter clauses (no effect on score, faster) ───────────────────────────
     filter_clauses = []
 
+    # File-type filter
     if file_type and file_type not in ("all", ""):
         filter_clauses.append({"term": {"file_type": file_type}})
 
+    # Date range filter on file modification date
     if from_date or to_date:
         date_range: dict = {}
-        if from_date: date_range["gte"] = from_date
-        if to_date:   date_range["lte"] = to_date
+        if from_date:
+            date_range["gte"] = from_date
+        if to_date:
+            date_range["lte"] = to_date
         filter_clauses.append({"range": {"modified": date_range}})
 
+    # ── Combine into bool query ───────────────────────────────────────────────
     es_query = {
         "bool": {
             "must":   must_clauses,
@@ -244,19 +275,19 @@ def search():
         }
     }
 
-    # ── Highlighting ─────────────────────────────────────────────────────────
+    # ── Highlight config ──────────────────────────────────────────────────────
     highlight_cfg = {
         "fields": {
             "content": {
-                "fragment_size":       200,
-                "number_of_fragments": 1,
-                "pre_tags":            ["<mark>"],
-                "post_tags":           ["</mark>"],
+                "fragment_size":        200,
+                "number_of_fragments":  1,
+                "pre_tags":             ["<mark>"],
+                "post_tags":            ["</mark>"],
             }
         }
     }
 
-    # ── Execute ──────────────────────────────────────────────────────────────
+    # ── Execute search ────────────────────────────────────────────────────────
     offset = (page - 1) * RESULTS_PER_PAGE
     try:
         resp = es.search(
@@ -286,7 +317,7 @@ def search():
             "snippet":       snippet,
         })
 
-    # ── Did you mean? ────────────────────────────────────────────────────────
+    # ── Did you mean? (only when zero results) ────────────────────────────────
     did_you_mean = None
     if total == 0:
         try:
@@ -296,21 +327,22 @@ def search():
                     "text": q_str,
                     "phrase_suggest": {
                         "phrase": {
-                            "field":     "content",
-                            "size":      1,
+                            "field":    "content",
+                            "size":     1,
                             "gram_size": 3,
-                            "direct_generator": [{
-                                "field":        "content",
-                                "suggest_mode": "missing"
-                            }],
+                            "direct_generator": [
+                                {"field": "content", "suggest_mode": "missing"}
+                            ],
                         }
-                    }
+                    },
                 },
                 size=0,
             )
-            options = (sug_resp.get("suggest", {})
-                               .get("phrase_suggest", [{}])[0]
-                               .get("options", []))
+            options = (
+                sug_resp.get("suggest", {})
+                .get("phrase_suggest", [{}])[0]
+                .get("options", [])
+            )
             if options:
                 did_you_mean = options[0]["text"]
         except Exception:
@@ -332,30 +364,31 @@ def search():
 def stats():
     if not ensure_connected():
         return jsonify({
-            "indexed": False, "total_docs": 0, "by_type": {}, "top_terms": [],
-            "error": f"Cannot connect to Elasticsearch at {ES_HOST}"
+            "indexed":    False,
+            "total_docs": 0,
+            "by_type":    {},
+            "top_terms":  [],
+            "error":      f"Cannot connect to Elasticsearch at {ES_HOST}",
         })
 
     if not es.indices.exists(index=INDEX_NAME):
         return jsonify({"indexed": False, "total_docs": 0, "by_type": {}, "top_terms": []})
 
-    # Total doc count
+    # Total document count
     total = es.count(index=INDEX_NAME)["count"]
 
-    # by_type aggregation
+    # Documents grouped by file type
     agg_resp = es.search(
         index=INDEX_NAME,
         size=0,
-        aggregations={
-            "by_type": {"terms": {"field": "file_type", "size": 20}}
-        }
+        aggregations={"by_type": {"terms": {"field": "file_type", "size": 20}}},
     )
     by_type = {
         b["key"]: b["doc_count"]
         for b in agg_resp["aggregations"]["by_type"]["buckets"]
     }
 
-    # Top 10 terms via significant_text aggregation
+    # Top 10 most significant terms in the content field
     top_terms = []
     try:
         terms_resp = es.search(
@@ -365,7 +398,7 @@ def stats():
                 "top_terms": {
                     "significant_text": {"field": "content", "size": 10}
                 }
-            }
+            },
         )
         for b in terms_resp["aggregations"]["top_terms"]["buckets"]:
             top_terms.append({"term": b["key"], "count": int(b["doc_count"])})
