@@ -7,7 +7,7 @@ Endpoints:
   GET  /api/stats         – Index stats (total docs, by-type, top-10 terms)
 
 Requires:
-  pip install elasticsearch flask flask-cors PyPDF2 openpyxl
+  pip install "elasticsearch==8.13.0" flask flask-cors PyPDF2 openpyxl
   Elasticsearch 8.x running on http://localhost:9200
 """
 
@@ -68,8 +68,13 @@ INDEX_MAPPING = {
             },
             "file_path": {"type": "keyword"},
             "file_type": {"type": "keyword"},
-            "content":   {"type": "text", "analyzer": "content_analyzer"},
-            "modified":  {"type": "date"},
+            # ✅ fielddata=True enables terms aggregation on this text field
+            "content": {
+                "type":      "text",
+                "analyzer":  "content_analyzer",
+                "fielddata": True,
+            },
+            "modified": {"type": "date"},
         }
     },
 }
@@ -232,33 +237,31 @@ def search():
     if not es.indices.exists(index=INDEX_NAME):
         return jsonify({"error": "Index not built yet. Go to the Index tab first."}), 503
 
-    # ── Main query ────────────────────────────────────────────────────────────
-    # query_string supports ALL required syntax in one place:
+    # ── Main query ─────────────────────────────────────────────────────────────
+    # query_string supports all IR syntax:
     #   Boolean  →  python AND flask  |  java OR python  |  search NOT google
     #   Grouping →  (python OR java) AND search
     #   Phrase   →  "information retrieval"
-    #   Fuzzy    →  retrival~  |  retrival~2
+    #   Fuzzy    →  retrival~
     #   Wildcard →  inform*  |  ?earch
     must_clauses = [
         {
             "query_string": {
-                "query":                q_str,
-                "fields":               ["content", "filename^2"],
-                "fuzziness":            "AUTO",
-                "default_operator":     "OR",
+                "query":                  q_str,
+                "fields":                 ["content", "filename^2"],
+                "fuzziness":              "AUTO",
+                "default_operator":       "OR",
                 "allow_leading_wildcard": True,
             }
         }
     ]
 
-    # ── Filter clauses (no effect on score, faster) ───────────────────────────
+    # ── Filter clauses (no effect on score) ───────────────────────────────────
     filter_clauses = []
 
-    # File-type filter
     if file_type and file_type not in ("all", ""):
         filter_clauses.append({"term": {"file_type": file_type}})
 
-    # Date range filter on file modification date
     if from_date or to_date:
         date_range: dict = {}
         if from_date:
@@ -267,7 +270,6 @@ def search():
             date_range["lte"] = to_date
         filter_clauses.append({"range": {"modified": date_range}})
 
-    # ── Combine into bool query ───────────────────────────────────────────────
     es_query = {
         "bool": {
             "must":   must_clauses,
@@ -275,19 +277,19 @@ def search():
         }
     }
 
-    # ── Highlight config ──────────────────────────────────────────────────────
+    # ── Highlight config ───────────────────────────────────────────────────────
     highlight_cfg = {
         "fields": {
             "content": {
-                "fragment_size":        200,
-                "number_of_fragments":  1,
-                "pre_tags":             ["<mark>"],
-                "post_tags":            ["</mark>"],
+                "fragment_size":       200,
+                "number_of_fragments": 1,
+                "pre_tags":            ["<mark>"],
+                "post_tags":           ["</mark>"],
             }
         }
     }
 
-    # ── Execute search ────────────────────────────────────────────────────────
+    # ── Execute ────────────────────────────────────────────────────────────────
     offset = (page - 1) * RESULTS_PER_PAGE
     try:
         resp = es.search(
@@ -317,7 +319,7 @@ def search():
             "snippet":       snippet,
         })
 
-    # ── Did you mean? (only when zero results) ────────────────────────────────
+    # ── Did you mean? (only when zero results) ─────────────────────────────────
     did_you_mean = None
     if total == 0:
         try:
@@ -327,8 +329,8 @@ def search():
                     "text": q_str,
                     "phrase_suggest": {
                         "phrase": {
-                            "field":    "content",
-                            "size":     1,
+                            "field":     "content",
+                            "size":      1,
                             "gram_size": 3,
                             "direct_generator": [
                                 {"field": "content", "suggest_mode": "missing"}
@@ -388,7 +390,8 @@ def stats():
         for b in agg_resp["aggregations"]["by_type"]["buckets"]
     }
 
-    # Top 10 most significant terms in the content field
+    # ✅ Top 10 terms using terms aggregation on content field (fielddata=True)
+    # This works with any number of documents unlike significant_text
     top_terms = []
     try:
         terms_resp = es.search(
@@ -396,7 +399,10 @@ def stats():
             size=0,
             aggregations={
                 "top_terms": {
-                    "significant_text": {"field": "content", "size": 10}
+                    "terms": {
+                        "field": "content",
+                        "size":  10,
+                    }
                 }
             },
         )
